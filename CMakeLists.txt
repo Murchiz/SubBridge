@@ -84,6 +84,7 @@ set(SOURCES
     src/parser.cpp
     src/generator.cpp
     src/server.cpp
+    src/subscription_params.cpp
     src/main.cpp
 )
 
@@ -136,6 +137,16 @@ add_executable(test_yaml ${TEST_SOURCES_YAML})
 add_test(NAME YamlTest COMMAND test_yaml)
 set_tests_properties(YamlTest PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
+# happ.ini / incy.ini parameter handling
+add_executable(test_subscription_params
+    tests/test_subscription_params.cpp
+    src/globals.cpp
+    src/utils.cpp
+    src/subscription_params.cpp
+)
+add_test(NAME SubscriptionParamsTest COMMAND test_subscription_params
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/reference/subscription_params)
+
 if(UNIX)
     add_executable(test_http_targets
         tests/test_http_targets.cpp
@@ -144,13 +155,14 @@ if(UNIX)
         src/parser.cpp
         src/generator.cpp
         src/server.cpp
+        src/subscription_params.cpp
     )
     add_test(NAME HttpTargetTest COMMAND test_http_targets)
     set_tests_properties(HttpTargetTest PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 endif()
 
 # Assertions must run in Release/CI builds too, not just Debug.
-foreach(test_target IN ITEMS test_parser test_xray test_yaml test_http_targets)
+foreach(test_target IN ITEMS test_parser test_xray test_yaml test_subscription_params test_http_targets)
     if(NOT TARGET ${test_target})
         continue()
     endif()

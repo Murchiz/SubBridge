@@ -149,6 +149,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path package
           Copy-Item build/release/sub_bridge.exe -Destination package/
           Copy-Item config.ini.example -Destination package/
+          Copy-Item happ.ini.example, incy.ini.example -Destination package/
           Compress-Archive -Path package/* -DestinationPath sub_bridge-windows-x64.zip
 
       - name: Prepare Linux Package
@@ -156,7 +157,7 @@ jobs:
         run: |
           mkdir -p package
           cp build/release/sub_bridge package/
-          cp config.ini.example package/
+          cp config.ini.example happ.ini.example incy.ini.example package/
           tar -czf sub_bridge-linux-x64.tar.gz -C package .
 
       - name: Upload Artifact Windows

@@ -49,16 +49,17 @@ struct DevInfo {
     char model[256]{};
 };
 
+struct SubscriptionParameter {
+    std::string name{};
+    std::string value{};
+};
+
 struct SubMetadata {
-    char userinfo[512]{};
-    char interval[128]{};
-    char disposition[512]{};
-    char profile_title[512]{};
-    char announce[2048]{};
-    char profile_web_page_url[1024]{};
-    char support_url[512]{};
-    char refill_date[128]{};
-    char content_type[128]{};
+    std::string content_type{};
+    // Subscription headers forwarded to clients (subscription-userinfo,
+    // profile-title, providerid, Happ/INCY app-management parameters, ...).
+    // Names are lowercase; the first source for a name wins.
+    std::vector<SubscriptionParameter> parameters{};
 };
 
 struct Route {
@@ -67,12 +68,19 @@ struct Route {
     int base_port{0};
     char target[64]{};
     char name[128]{};
+    char section[128]{}; // config.ini section, e.g. "Sub_Main"
     char urls[8][2048]{};
     int url_count{0};
     int use_hwid{0};
     int is_subconverter{0};
     char user_agents[8][128]{};
     int force_balancer{0};
+    // Remove upstream Happ / INCY app-management parameters (config.ini).
+    bool strip_happ{false};
+    bool strip_incy{false};
+    // Parameters added from happ.ini / incy.ini. An empty value removes it.
+    std::vector<SubscriptionParameter> happ_parameters{};
+    std::vector<SubscriptionParameter> incy_parameters{};
     SOCKET listen_sock{INVALID_SOCKET};
 };
 

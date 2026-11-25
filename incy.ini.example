@@ -1,0 +1,8 @@
+# Copy to incy.ini next to config.ini and restart SubBridge.
+# Use the same [Sub_*] section as in config.ini, or the route's display name.
+# These settings are returned as HTTP headers to INCY clients.
+[Sub_Main]
+# profile-title = My INCY Subscription
+# profile-update-interval = 6
+# sort-order = ping
+# support-url = https://example.com/support

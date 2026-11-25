@@ -1,0 +1,8 @@
+# Copy to happ.ini next to config.ini and restart SubBridge.
+# Use the same [Sub_*] section as in config.ini, or the route's display name.
+# These settings are returned as HTTP headers to Happ clients.
+[Sub_Main]
+# providerid = YOUR_HAPP_PROVIDER_ID
+# profile-title = My Happ Subscription
+# profile-update-interval = 6
+# subscriptions-sort-type = ping

@@ -1,0 +1,5 @@
+#providerid body-provider
+#hide-settings: 0
+#announce: upstream
+#hide-url: 0
+vless://00000000-0000-0000-0000-000000000001@198.51.100.1:443?encryption=none#node

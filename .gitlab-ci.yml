@@ -60,7 +60,7 @@ deploy-job:
     - echo "Deploying application..."
     - mkdir -p package
     - cp build/ci/sub_bridge package/
-    - cp config.ini.example package/
+    - cp config.ini.example happ.ini.example incy.ini.example package/
     - tar -czf sub_bridge-linux-x64.tar.gz -C package .
     - echo "Application successfully deployed."
   artifacts:

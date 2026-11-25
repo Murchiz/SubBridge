@@ -3,7 +3,10 @@
 #include "parser.h"
 #include "generator.h"
 #include "safe_crt.h"
+#include "subscription_params.h"
 #include <thread>
+#include <chrono>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -14,7 +17,9 @@
 #include <memory>
 #include <stdexcept>
 
-#ifndef _WIN32
+#ifdef _WIN32
+#include <ws2tcpip.h>
+#else
 #include <curl/curl.h>
 #define closesocket close
 #define SD_SEND SHUT_WR
@@ -31,6 +36,48 @@ void copy_limited(char *dst, int cap, const char *src) {
 
 namespace {
 
+bool send_all(SOCKET socket, std::string_view bytes) {
+#ifdef MSG_NOSIGNAL
+    constexpr int flags = MSG_NOSIGNAL;
+#else
+    constexpr int flags = 0;
+#endif
+    while (!bytes.empty()) {
+        const auto sent = send(socket, bytes.data(), static_cast<int>(bytes.size()), flags);
+        if (sent <= 0) return false;
+        bytes.remove_prefix(sent);
+    }
+    return true;
+}
+
+std::string peer_name(SOCKET socket) {
+    sockaddr_in addr{};
+#ifdef _WIN32
+    int len = sizeof(addr);
+#else
+    socklen_t len = sizeof(addr);
+#endif
+    if (getpeername(socket, reinterpret_cast<sockaddr *>(&addr), &len) != 0 || addr.sin_family != AF_INET) {
+        return "unknown";
+    }
+    char ip[INET_ADDRSTRLEN]{};
+    if (!inet_ntop(AF_INET, &addr.sin_addr, ip, sizeof(ip))) return "unknown";
+    return std::format("{}:{}", ip, ntohs(addr.sin_port));
+}
+
+// Classify requests without logging raw bytes, URLs or credentials.
+bool starts_with_tls(std::string_view bytes) {
+    return bytes.starts_with("\x16\x03");
+}
+
+std::string_view request_kind(std::string_view bytes) {
+    if (bytes.empty()) return "no data";
+    if (bytes.starts_with("GET ")) return "GET";
+    if (bytes.starts_with("HEAD ")) return "HEAD";
+    if (bytes.starts_with("CONNECT ")) return "CONNECT";
+    return "unrecognized data";
+}
+
 #ifdef _WIN32
 struct WinHttpHandleCloser {
     void operator()(HINTERNET h) const noexcept {
@@ -40,34 +87,26 @@ struct WinHttpHandleCloser {
 
 using ScopedHInternet = std::unique_ptr<void, WinHttpHandleCloser>;
 
-bool query_header(HINTERNET req, const wchar_t *name, char *out, int cap) {
-    if (!out || cap <= 0) return false;
-    out[0] = '\0';
+void query_metadata(HINTERNET req, SubMetadata& meta) {
+    DWORD bytes = 0;
+    WinHttpQueryHeaders(req, WINHTTP_QUERY_RAW_HEADERS_CRLF, WINHTTP_HEADER_NAME_BY_INDEX,
+                        nullptr, &bytes, WINHTTP_NO_HEADER_INDEX);
+    if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || !bytes) return;
 
-    wchar_t wbuf[2048] = {0};
-    DWORD wlen = sizeof(wbuf);
-    if (!WinHttpQueryHeaders(req, WINHTTP_QUERY_CUSTOM, name, wbuf, &wlen, WINHTTP_NO_HEADER_INDEX)) {
-        return false;
+    std::wstring wide(bytes / sizeof(wchar_t), L'\0');
+    if (!WinHttpQueryHeaders(req, WINHTTP_QUERY_RAW_HEADERS_CRLF, WINHTTP_HEADER_NAME_BY_INDEX,
+                             wide.data(), &bytes, WINHTTP_NO_HEADER_INDEX)) return;
+    const int length = WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    if (length <= 1) return;
+    std::string utf8(length, '\0');
+    if (!WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), -1, utf8.data(), length, nullptr, nullptr)) return;
+    std::string_view headers(utf8.data(), length - 1);
+    while (!headers.empty()) {
+        const auto end = headers.find('\n');
+        read_subscription_header(meta, headers.substr(0, end));
+        if (end == headers.npos) break;
+        headers.remove_prefix(end + 1);
     }
-
-    WideCharToMultiByte(CP_UTF8, 0, wbuf, -1, out, cap, nullptr, nullptr);
-    out[cap - 1] = '\0';
-    return out[0] != '\0';
-}
-
-bool query_content_type(HINTERNET req, char *out, int cap) {
-    if (!out || cap <= 0) return false;
-    out[0] = '\0';
-
-    wchar_t wbuf[256] = {0};
-    DWORD wlen = sizeof(wbuf);
-    if (!WinHttpQueryHeaders(req, WINHTTP_QUERY_CONTENT_TYPE, WINHTTP_HEADER_NAME_BY_INDEX, wbuf, &wlen, WINHTTP_NO_HEADER_INDEX)) {
-        return false;
-    }
-
-    WideCharToMultiByte(CP_UTF8, 0, wbuf, -1, out, cap, nullptr, nullptr);
-    out[cap - 1] = '\0';
-    return out[0] != '\0';
 }
 #else
 struct MemoryStruct {
@@ -97,55 +136,18 @@ static size_t HeaderCallback(char *buffer, size_t size, size_t nitems, void *use
     if (!meta) return total;
 
     std::string_view line(buffer, total);
-    while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) {
-        line.remove_suffix(1);
-    }
-    size_t colon = line.find(':');
-    if (colon != std::string_view::npos) {
-        std::string_view name = line.substr(0, colon);
-        std::string_view val = line.substr(colon + 1);
-        while (!val.empty() && (val.front() == ' ' || val.front() == '\t')) val.remove_prefix(1);
-        std::string val_str(val);
-
-        auto ci_eq = [](std::string_view a, std::string_view b) {
-            return std::ranges::equal(a, b, [](char x, char y) {
-                return std::tolower(static_cast<unsigned char>(x)) == std::tolower(static_cast<unsigned char>(y));
-            });
-        };
-
-        if (ci_eq(name, "Subscription-Userinfo")) copy_limited(meta->userinfo, sizeof(meta->userinfo), val_str.c_str());
-        else if (ci_eq(name, "Profile-Update-Interval")) copy_limited(meta->interval, sizeof(meta->interval), val_str.c_str());
-        else if (ci_eq(name, "Content-Disposition")) copy_limited(meta->disposition, sizeof(meta->disposition), val_str.c_str());
-        else if (ci_eq(name, "Profile-Title")) copy_limited(meta->profile_title, sizeof(meta->profile_title), val_str.c_str());
-        else if (ci_eq(name, "Announce")) copy_limited(meta->announce, sizeof(meta->announce), val_str.c_str());
-        else if (ci_eq(name, "Profile-Web-Page-Url")) copy_limited(meta->profile_web_page_url, sizeof(meta->profile_web_page_url), val_str.c_str());
-        else if (ci_eq(name, "Support-Url")) copy_limited(meta->support_url, sizeof(meta->support_url), val_str.c_str());
-        else if (ci_eq(name, "Subscription-Refill-Date")) copy_limited(meta->refill_date, sizeof(meta->refill_date), val_str.c_str());
-        else if (ci_eq(name, "Content-Type")) copy_limited(meta->content_type, sizeof(meta->content_type), val_str.c_str());
-    }
+    // libcurl also reports intermediate responses (redirects and proxy CONNECT).
+    if (line.starts_with("HTTP/")) *meta = {};
+    else read_subscription_header(*meta, line);
     return total;
 }
 #endif
 
 void merge_metadata(SubMetadata& dst, const SubMetadata& src) {
-    if (!dst.userinfo[0] && src.userinfo[0]) copy_limited(dst.userinfo, sizeof(dst.userinfo), src.userinfo);
-    if (!dst.interval[0] && src.interval[0]) copy_limited(dst.interval, sizeof(dst.interval), src.interval);
-    if (!dst.disposition[0] && src.disposition[0]) copy_limited(dst.disposition, sizeof(dst.disposition), src.disposition);
-    if (!dst.profile_title[0] && src.profile_title[0]) copy_limited(dst.profile_title, sizeof(dst.profile_title), src.profile_title);
-    if (!dst.announce[0] && src.announce[0]) copy_limited(dst.announce, sizeof(dst.announce), src.announce);
-    if (!dst.profile_web_page_url[0] && src.profile_web_page_url[0]) copy_limited(dst.profile_web_page_url, sizeof(dst.profile_web_page_url), src.profile_web_page_url);
-    if (!dst.support_url[0] && src.support_url[0]) copy_limited(dst.support_url, sizeof(dst.support_url), src.support_url);
-    if (!dst.refill_date[0] && src.refill_date[0]) copy_limited(dst.refill_date, sizeof(dst.refill_date), src.refill_date);
-    if (!dst.content_type[0] && src.content_type[0]) copy_limited(dst.content_type, sizeof(dst.content_type), src.content_type);
-}
-
-std::string header_safe(const char *value) {
-    std::string out;
-    if (!value) return out;
-    for (const char *p = value; *p; p++) {
-        out += (*p == '\r' || *p == '\n') ? ' ' : *p;
+    if (dst.content_type.empty()) dst.content_type = src.content_type;
+    for (const auto& param : src.parameters) {
+        set_subscription_parameter(dst, param.name, param.value, false);
     }
-    return out;
 }
 
 std::string lower_copy(std::string_view value) {
@@ -186,16 +188,11 @@ std::string target_from_user_agent(std::string_view ua) {
     }
     if (contains_ci(ua, "v2ray") || contains_ci(ua, "xray") ||
         contains_ci(ua, "nekobox") || contains_ci(ua, "nekoray") ||
-        contains_ci(ua, "happ") || contains_ci(ua, "hiddify") ||
+        contains_ci(ua, "hiddify") ||
         contains_ci(ua, "streisand") || contains_ci(ua, "shadowrocket")) {
         return "v2ray";
     }
     return "";
-}
-
-void append_header(std::string& headers, const char *name, const char *value) {
-    if (!value || !value[0]) return;
-    headers += std::format("{}: {}\r\n", name, header_safe(value));
 }
 
 std::string quoted_filename(const char *name) {
@@ -213,23 +210,18 @@ void apply_route_name(SubMetadata& meta, const char *name) {
     if (!name || !name[0]) return;
 
     std::string title = std::format("base64:{}", base64_encode(name));
-    copy_limited(meta.profile_title, sizeof(meta.profile_title), title.c_str());
+    set_subscription_parameter(meta, "profile-title", title);
 
     std::string disp = std::format("attachment; filename=\"{}\"; filename*=UTF-8''{}",
                                    quoted_filename(name), url_encode(name));
-    copy_limited(meta.disposition, sizeof(meta.disposition), disp.c_str());
+    set_subscription_parameter(meta, "content-disposition", disp);
 }
 
 std::string metadata_headers(const SubMetadata& meta) {
     std::string headers;
-    append_header(headers, "Subscription-Userinfo", meta.userinfo);
-    append_header(headers, "Profile-Update-Interval", meta.interval);
-    append_header(headers, "Profile-Title", meta.profile_title);
-    append_header(headers, "Announce", meta.announce);
-    append_header(headers, "Profile-Web-Page-Url", meta.profile_web_page_url);
-    append_header(headers, "Support-Url", meta.support_url);
-    append_header(headers, "Subscription-Refill-Date", meta.refill_date);
-    append_header(headers, "Content-Disposition", meta.disposition);
+    for (const auto& param : meta.parameters) {
+        if (!param.value.empty()) headers += std::format("{}: {}\r\n", param.name, param.value);
+    }
     return headers;
 }
 
@@ -268,6 +260,11 @@ void merge_metadata_for_target(SubMetadata& dst, const SubMetadata& src, bool pr
     }
     if (!have_preferred || preferred) {
         merge_metadata(dst, src);
+    } else {
+        // A source of a different format can still supply a missing ID.
+        for (const auto& param : src.parameters) {
+            if (param.name == "providerid") set_subscription_parameter(dst, param.name, param.value, false);
+        }
     }
 }
 
@@ -280,7 +277,7 @@ int fetch_url(const Route *rt, char *buf, int cap, const wchar_t* custom_ua, int
     char full_url[4096]{};
     std::wstring object_name;
 
-    if (out_meta) memset(out_meta, 0, sizeof(*out_meta));
+    if (out_meta) *out_meta = {};
 
     copy_limited(full_url, sizeof(full_url), rt->urls[url_index]);
 
@@ -335,6 +332,9 @@ int fetch_url(const Route *rt, char *buf, int cap, const wchar_t* custom_ua, int
     if (uc.lpszExtraInfo && uc.dwExtraInfoLength) {
         object_name.append(uc.lpszExtraInfo, uc.dwExtraInfoLength);
     }
+    if (const auto fragment = object_name.find(L'#'); fragment != object_name.npos) {
+        object_name.resize(fragment);
+    }
 
     HINTERNET raw_hR = WinHttpOpenRequest(hC.get(), L"GET", object_name.c_str(), nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
                                           (uc.nScheme == INTERNET_SCHEME_HTTPS) ? WINHTTP_FLAG_SECURE : 0);
@@ -366,17 +366,7 @@ int fetch_url(const Route *rt, char *buf, int cap, const wchar_t* custom_ua, int
         if (code != 200) { return -static_cast<int>(code); }
     }
 
-    if (out_meta) {
-        query_header(hR.get(), L"Subscription-Userinfo", out_meta->userinfo, sizeof(out_meta->userinfo));
-        query_header(hR.get(), L"Profile-Update-Interval", out_meta->interval, sizeof(out_meta->interval));
-        query_header(hR.get(), L"Content-Disposition", out_meta->disposition, sizeof(out_meta->disposition));
-        query_header(hR.get(), L"Profile-Title", out_meta->profile_title, sizeof(out_meta->profile_title));
-        query_header(hR.get(), L"Announce", out_meta->announce, sizeof(out_meta->announce));
-        query_header(hR.get(), L"Profile-Web-Page-Url", out_meta->profile_web_page_url, sizeof(out_meta->profile_web_page_url));
-        query_header(hR.get(), L"Support-Url", out_meta->support_url, sizeof(out_meta->support_url));
-        query_header(hR.get(), L"Subscription-Refill-Date", out_meta->refill_date, sizeof(out_meta->refill_date));
-        query_content_type(hR.get(), out_meta->content_type, sizeof(out_meta->content_type));
-    }
+    if (out_meta) query_metadata(hR.get(), *out_meta);
 
     total = 0;
     for (;;) {
@@ -393,7 +383,7 @@ int fetch_url(const Route *rt, char *buf, int cap, const wchar_t* custom_ua, int
 #else
 int fetch_url(const Route *rt, char *buf, int cap, const wchar_t* custom_ua, int url_index,
               SubMetadata *out_meta) {
-    if (out_meta) std::memset(out_meta, 0, sizeof(*out_meta));
+    if (out_meta) *out_meta = {};
     char full_url[4096]{};
     copy_limited(full_url, sizeof(full_url), rt->urls[url_index]);
 
@@ -472,7 +462,8 @@ int fetch_url(const Route *rt, char *buf, int cap, const wchar_t* custom_ua, int
 }
 #endif
 
-static void serve_converted_or_raw(SOCKET c, const Route *source_rt, const std::string& target, int log_port) {
+static void serve_converted_or_raw(SOCKET c, const Route *source_rt, const std::string& target, int log_port,
+                                   SubscriptionApp app) {
     if (!target.empty() && !is_supported_target(target)) {
         constexpr std::string_view message = "Unsupported conversion target\n";
         const std::string response = std::format(
@@ -489,6 +480,11 @@ static void serve_converted_or_raw(SOCKET c, const Route *source_rt, const std::
         return;
     }
 
+    const auto started = std::chrono::steady_clock::now();
+    const auto elapsed_ms = [started] {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - started).count();
+    };
     std::string out_payload;
     std::vector<Proxy> all_proxies;
     std::vector<Balancer> all_balancers;
@@ -496,6 +492,7 @@ static void serve_converted_or_raw(SOCKET c, const Route *source_rt, const std::
     int success_count = 0;
 
     SubMetadata meta{};
+    const auto overrides = select_app_parameters(*source_rt, app);
     bool have_preferred_meta = false;
 
     for (int i = 0; i < source_rt->url_count; i++) {
@@ -503,13 +500,15 @@ static void serve_converted_or_raw(SOCKET c, const Route *source_rt, const std::
         int blen = fetch_url(source_rt, body, static_cast<int>(BODY_CAP), nullptr, i, &temp_meta);
         if (blen >= 0) {
             success_count++;
+            std::string filtered;
+            const auto payload = filter_subscription_payload(
+                std::string_view(body, blen), *source_rt, overrides, temp_meta, filtered, !target.empty());
+            read_provider_id_fragment(temp_meta, source_rt->urls[i]);
             if (!target.empty()) {
                 merge_metadata_for_target(meta, temp_meta, preferred_metadata_source(target, *source_rt, i, temp_meta), have_preferred_meta);
             } else {
                 merge_metadata(meta, temp_meta);
             }
-
-            std::string_view payload(body, blen);
 
             if (!target.empty()) {
                 std::vector<Proxy> p;
@@ -521,7 +520,7 @@ static void serve_converted_or_raw(SOCKET c, const Route *source_rt, const std::
                 all_rules.insert(all_rules.end(), r.begin(), r.end());
             } else {
                 if (!out_payload.empty()) out_payload += "\n";
-                out_payload.append(body, blen);
+                out_payload.append(payload);
             }
         }
     }
@@ -548,7 +547,7 @@ static void serve_converted_or_raw(SOCKET c, const Route *source_rt, const std::
                 out_payload = gen_v2ray(all_proxies);
                 content_type = converted_content_type(target);
             } else {
-                content_type = meta.content_type[0] ? header_safe(meta.content_type) : "text/plain; charset=utf-8";
+                content_type = meta.content_type.empty() ? "text/plain; charset=utf-8" : meta.content_type;
             }
         } catch (const std::invalid_argument& e) {
             const std::string message = std::string(e.what()) + "\n";
@@ -564,7 +563,11 @@ static void serve_converted_or_raw(SOCKET c, const Route *source_rt, const std::
         }
 
         apply_route_name(meta, source_rt->name);
-        std::string extra_hdrs = metadata_headers(meta);
+        apply_subscription_parameters(meta, *source_rt, overrides, app);
+        // Both format and metadata can depend on User-Agent. Subscription
+        // responses can include credentials (including the fallback URL).
+        const std::string extra_hdrs = metadata_headers(meta) +
+            "Vary: User-Agent\r\nCache-Control: no-store\r\n";
 
         std::string hdr = std::format("HTTP/1.1 200 OK\r\n"
                                       "Content-Type: {}\r\n"
@@ -572,17 +575,16 @@ static void serve_converted_or_raw(SOCKET c, const Route *source_rt, const std::
                                       "{}"
                                       "Connection: close\r\n\r\n",
                                       content_type, out_payload.length(), extra_hdrs);
-        send(c, hdr.c_str(), static_cast<int>(hdr.length()), 0);
-        send(c, out_payload.c_str(), static_cast<int>(out_payload.length()), 0);
-        if (!target.empty()) {
-            logm("  [OK] Port %d (target=%s) -> 200 OK (%zu bytes)\n\n", log_port, target.c_str(), out_payload.length());
+        if (!send_all(c, hdr) || !send_all(c, out_payload)) {
+            logm_fmt("  [FAIL] Port {} -> response write failed ({} ms)\n\n", log_port, elapsed_ms());
         } else {
-            logm("  [OK] Port %d -> 200 OK (%zu bytes)\n\n", log_port, out_payload.length());
+            logm_fmt("  [OK] Port {} (target={}) -> 200 OK ({} bytes, {} ms)\n\n",
+                log_port, target.empty() ? "raw" : target, out_payload.size(), elapsed_ms());
         }
     } else {
         constexpr std::string_view e = "HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain\r\nContent-Length: 15\r\nConnection: close\r\n\r\nupstream failed";
         send(c, e.data(), static_cast<int>(e.length()), 0);
-        logm("  [FAIL] Port %d -> 502 Upstream Failed\n\n", log_port);
+        logm_fmt("  [FAIL] Port {} -> 502 Upstream Failed ({} ms)\n\n", log_port, elapsed_ms());
     }
     mem_free(body);
 }
@@ -647,7 +649,8 @@ void handle_subconverter(SOCKET c, std::string_view req) {
         temp_rt.force_balancer = force_balancer;
     }
 
-    serve_converted_or_raw(c, source_rt, target, 25500);
+    const auto app = subscription_app_for_user_agent(request_header(req, "User-Agent"));
+    serve_converted_or_raw(c, source_rt, target, 25500, app);
 }
 
 void handle_client(SOCKET c, const Route *rt) {
@@ -663,16 +666,60 @@ void handle_client(SOCKET c, const Route *rt) {
     setsockopt(c, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 #endif
 
-    char req[2048]{};
-    int n = recv(c, req, sizeof(req) - 1, 0);
-    if (n <= 0) {
-        closesocket(c);
-        return;
+    // Log the connection before reading anything. A TCP connection can
+    // succeed even if it never produces a complete HTTP request.
+    const auto peer = g_IsCon ? peer_name(c) : std::string{};
+    logm_fmt("  [TCP] Port {} connection from {}\n", rt->local_port, peer);
+
+    // One TCP read is not necessarily one HTTP request. The User-Agent
+    // (needed for app detection) may arrive in a later read.
+    char req[16384];
+    size_t used = 0;
+    std::string_view req_view;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(CL_TIMEOUT);
+    while (!req_view.contains("\r\n\r\n")) {
+        if (used == sizeof(req)) {
+            logm_fmt("  [TCP] Port {} {} headers too large\n", rt->local_port, peer);
+            send_all(c, "HTTP/1.1 431 Request Header Fields Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            closesocket(c);
+            return;
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            logm_fmt("  [TCP] Port {} {} timed out waiting for HTTP headers ({})\n",
+                     rt->local_port, peer, request_kind(req_view));
+            closesocket(c);
+            return;
+        }
+        const auto n = recv(c, req + used, static_cast<int>(sizeof(req) - used), 0);
+        if (n <= 0) {
+            if (n == 0) {
+                logm_fmt("  [TCP] Port {} {} closed before HTTP headers ({})\n",
+                         rt->local_port, peer, request_kind(req_view));
+            } else {
+#ifdef _WIN32
+                const int error = WSAGetLastError();
+#else
+                const int error = errno;
+#endif
+                logm_fmt("  [TCP] Port {} {} could not read HTTP headers ({}, socket error {})\n",
+                         rt->local_port, peer, request_kind(req_view), error);
+            }
+            closesocket(c);
+            return;
+        }
+        used += n;
+        req_view = std::string_view(req, used);
+        if (starts_with_tls(req_view)) {
+            logm_fmt("  [TCP] Port {} {} sent TLS to a plain HTTP listener\n", rt->local_port, peer);
+            closesocket(c);
+            return;
+        }
     }
-    req[n] = '\0';
-    std::string_view req_view(req, n);
+    req_view = req_view.substr(0, req_view.find("\r\n\r\n") + 2);
 
     if (!req_view.starts_with("GET ")) {
+        logm_fmt("  [HTTP] Port {} {} unexpected {}\n", rt->local_port, peer,
+                 request_kind(req_view));
         constexpr std::string_view r = "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
         send(c, r.data(), static_cast<int>(r.length()), 0);
         closesocket(c);
@@ -687,6 +734,8 @@ void handle_client(SOCKET c, const Route *rt) {
     }
 
     logm("  [REQ] Port %d\n", rt->local_port);
+    const auto user_agent = request_header(req_view, "User-Agent");
+    const auto app = subscription_app_for_user_agent(user_agent);
 
     if (rt->is_convert) {
         const Route *source_rt = rt;
@@ -696,13 +745,20 @@ void handle_client(SOCKET c, const Route *rt) {
                 break;
             }
         }
-        serve_converted_or_raw(c, source_rt, rt->target, rt->local_port);
+        serve_converted_or_raw(c, source_rt, rt->target, rt->local_port, app);
     } else {
-        std::string auto_target = target_from_user_agent(request_header(req_view, "User-Agent"));
+        // Preserve native subscription formats for Happ/INCY with a single
+        // upstream. Normalize multi-source app routes instead of concatenating
+        // standalone JSON arrays or Base64 payloads.
+        std::string auto_target;
+        if (app != SubscriptionApp::other && rt->url_count > 1) auto_target = "v2ray";
+        else if (app == SubscriptionApp::other) {
+            auto_target = target_from_user_agent(user_agent);
+        }
         if (!auto_target.empty()) {
             logm("  [AUTO] Port %d UA target=%s\n", rt->local_port, auto_target.c_str());
         }
-        serve_converted_or_raw(c, rt, auto_target, rt->local_port);
+        serve_converted_or_raw(c, rt, auto_target, rt->local_port, app);
     }
 
     shutdown(c, SD_SEND);

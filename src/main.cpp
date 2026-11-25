@@ -4,6 +4,7 @@
 #include "generator.h"
 #include "utils.h"
 #include "safe_crt.h"
+#include "subscription_params.h"
 #include <cstdio>
 #include <cstring>
 #include <cctype>
@@ -175,8 +176,10 @@ void load_config() {
     char links[8][2048]{};
     char uas[8][128]{};
     char sub_name[128]{};
+    char sub_section[128]{};
     int link_count = 0;
     int port = 0, hwid = 0, force_balancer = 0;
+    bool r_strip_happ = false, r_strip_incy = false;
     char converts[1024]{};
 
     auto commit_sub = [&]() {
@@ -188,12 +191,15 @@ void load_config() {
             r->is_subconverter = 0;
             r->url_count = link_count;
             safe_strncpy(r->name, sub_name);
+            safe_strncpy(r->section, sub_section);
             for (int i = 0; i < link_count; i++) {
                 safe_strncpy(r->urls[i], links[i]);
                 safe_strncpy(r->user_agents[i], uas[i]);
             }
             r->use_hwid = hwid;
             r->force_balancer = force_balancer;
+            r->strip_happ = r_strip_happ;
+            r->strip_incy = r_strip_incy;
 
             if (converts[0]) {
                 int c_idx = 1;
@@ -224,7 +230,9 @@ void load_config() {
         }
         for (int i = 0; i < 8; i++) { links[i][0] = 0; uas[i][0] = 0; }
         sub_name[0] = 0;
+        sub_section[0] = 0;
         link_count = 0; port = 0; hwid = 0; force_balancer = 0; converts[0] = 0;
+        r_strip_happ = false; r_strip_incy = false;
     };
 
     while (std::getline(f, raw_line)) {
@@ -233,7 +241,13 @@ void load_config() {
 
         if (line.front() == '[') {
             commit_sub();
-            if (istarts_with(line, "[Sub_")) { in_sub = 1; in_dev = 0; }
+            if (istarts_with(line, "[Sub_")) {
+                in_sub = 1; in_dev = 0;
+                if (const auto end = line.find(']'); end != line.npos) {
+                    const std::string section(trim_sv(line.substr(1, end - 1)));
+                    safe_strncpy(sub_section, section.c_str());
+                }
+            }
             else if (iequals(line, "[Device]")) { in_sub = 0; in_dev = 1; }
             else { in_sub = 0; in_dev = 0; }
             continue;
@@ -261,6 +275,8 @@ void load_config() {
             else if (iequals(k, "port")) port = atoi(v_str.c_str());
             else if (iequals(k, "hwid")) hwid = (iequals(v, "true") || iequals(v, "1"));
             else if (iequals(k, "force_balancer")) force_balancer = (iequals(v, "true") || iequals(v, "1"));
+            else if (iequals(k, "strip_happ")) r_strip_happ = (iequals(v, "true") || iequals(v, "1"));
+            else if (iequals(k, "strip_incy")) r_strip_incy = (iequals(v, "true") || iequals(v, "1"));
             else if (iequals(k, "converts")) safe_strncpy(converts, v_str.c_str());
         } else if (in_dev) {
             if (iequals(k, "hwid")) safe_strncpy(g_Dev.hwid, v_str.c_str());
@@ -270,6 +286,7 @@ void load_config() {
         }
     }
     commit_sub();
+    load_subscription_parameters(cfg_path.parent_path());
 }
 
 #ifdef _WIN32

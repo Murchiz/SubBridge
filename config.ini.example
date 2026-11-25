@@ -47,6 +47,11 @@ converts = clash, singbox-android, singbox-pc, xray, xray-one, xray-jsons
 # Force SubBridge generic Auto balancer group even if upstream already provides auto-balancers (default: false)
 force_balancer = false
 
+# Remove upstream app-management parameters while retaining providerid, title and quota.
+# Use happ.ini and incy.ini (section [Sub_Main]) to add your own parameters.
+# strip_happ = true
+# strip_incy = true
+
 # ------------------------------------------------------------------------------
 # Additional Subscription Example
 # ------------------------------------------------------------------------------

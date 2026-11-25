@@ -118,7 +118,53 @@ force_balancer = false
 # Port 25506 -> Xray Standalone Config JSON
 # Port 25507 -> Xray Configs Array JSON ([...])
 converts = clash, singbox-android, singbox-pc, xray, xray-one, xray-jsons
+
+# Optional: remove upstream Happ / INCY app-management parameters
+# strip_happ = true
+# strip_incy = true
 ```
+
+### Happ and INCY subscription parameters
+
+SubBridge can remove or add Happ ([app management](https://www.happ.su/main/dev-docs/app-management)) and INCY ([app management](https://github.com/INCY-DEV/incy-docs/blob/main/ru/dev-docs/app-management.en.md)) parameters for each `[Sub_*]` route.
+
+- **Strip:** `strip_happ = true` or `strip_incy = true` removes that app's upstream directives from headers and from link-list bodies, including plain and Base64 lists and routing lines. Shared keys such as `announce` or `fragmentation-enable` are removed when either flag is set. `providerid`, `profile-title`, `subscription-userinfo`, and `subscription-refill-date` are kept.
+- **Add:** create `happ.ini` and/or `incy.ini` next to `config.ini` (see [`happ.ini.example`](happ.ini.example) and [`incy.ini.example`](incy.ini.example)). Use the same section as in `config.ini` (for example, `[Sub_Main]`). The route's display `name` still works as an alias; if both are present, the matching `config.ini` section takes precedence. Section matching is case-insensitive for ASCII letters. Values are sent as response headers only to the matching client: a User-Agent product token of `Happ` or `INCY` (for example `Happ/3.23.0` or `INCY-Desktop/1.0`). A configured key also removes the same `#key:` line from the body, so the configured value wins. A blank value removes that parameter. Unknown keys for the file are ignored with a console warning; `providerid` is accepted only in `happ.ini`.
+- **Provider ID:** the upstream `providerid` is always kept, from a header, a `#providerid` body line, or a `#?providerid=` subscription URL fragment. It is forwarded as a header, so it survives conversion to JSON/YAML targets. `providerid` in `happ.ini` replaces it for Happ clients; a blank value there is ignored rather than removing the upstream ID.
+
+By default, SubBridge relays supported Happ and INCY subscription headers and link-list directives. It always blocks `new-url` and `new-domain` so an upstream cannot change the client's saved bridge URL. Stripping runs before local overrides. These rules apply to subscription response metadata, not settings inside node configurations or the [INCY Premium API](https://github.com/INCY-DEV/incy-docs/blob/main/ru/dev-docs/premium-api.en.md). Happ still validates the provider ID against the subscription domain.
+
+For Happ requests, a route with exactly one HTTP(S) upstream sends its configured `link1` as `fallback-url`, even when stripping is enabled. A merged route never sends a fallback, even if only one upstream responds. SubBridge ignores upstream and INI `fallback-url` values. The original URL can contain a private subscription token, and User-Agent matching is not access control; keep these endpoints restricted to trusted clients.
+
+With one upstream, Happ and INCY requests on the base port preserve the upstream format, including native Xray JSON. Explicit conversion ports still use their configured targets. Happ and INCY routes that merge multiple upstreams normalize to V2Ray links on the base port.
+
+For example, for `[Sub_Main]` in `config.ini`:
+
+```ini
+# happ.ini
+[Sub_Main]
+subscriptions-sort-type = ping
+profile-update-interval = 6
+```
+
+```ini
+# incy.ini
+[Sub_Main]
+sort-order = ping
+profile-update-interval = 6
+```
+
+Restart SubBridge after editing the files.
+
+### Connecting from phones
+
+SubBridge serves plain HTTP and has no authentication. Anyone who can reach a subscription port can read the subscription, including the original upstream URL sent to Happ as `fallback-url`. Restrict access to trusted devices and do not forward the ports on your router.
+
+Use the PC's LAN address on the phone, for example `http://192.168.1.10:25501/`. `127.0.0.1` on a phone refers to the phone itself. If Happ times out, try the same URL on the same phone in a browser or another subscription client, with the phone on Wi-Fi and its VPN disconnected. If the other client reaches SubBridge but Happ does not, check Happ's local network access. On Android 17, go to **Settings → Apps → Happ → Permissions → Nearby devices** and tap **Allow**, then refresh the subscription.
+
+In `--console` mode, each accepted connection logs a `[TCP]` line with the peer address before SubBridge reads the request. If there is no `[TCP]` entry, SubBridge did not accept a connection; check phone permissions, routing and the PC firewall. `[TCP]` without `[REQ]` on a subscription port means the connection opened but did not produce a complete HTTP GET; the console logs why, for example if the client sent TLS to the plain HTTP port.
+
+INCY rejects cleartext HTTP, and SubBridge has no built-in HTTPS. A reverse proxy can provide HTTPS without making the subscription public, but TLS alone does not restrict who can read it. If you use a proxy, limit it to trusted devices on your LAN or private network using firewall or proxy access rules, use a certificate the client trusts, and block direct access to the backend from untrusted devices. Do not proxy the embedded subconverter on port `25500`.
 
 ---
 
@@ -207,7 +253,8 @@ Tests include:
 - `ParserTest`: URI parsing, Base64 decoding, Xray JSON & gRPC node validation, balancer deduplication, Sing-box 1.14+ syntax, and `xray-jsons` generation
 - `XrayTest`: Component generation, empty-input handling, XHTTP mode/extra round trips, and upstream balancer preservation when aggregating with unrelated gRPC nodes
 - `XrayFidelityTest`: Offline CLI validation using an independent JSON parser and sanitized `leastLoad`, Hysteria 2, and gRPC Reality fixtures; not a client import test
-- `HttpTargetTest` (POSIX): HTTP rejection of unsupported targets and success checks for supported targets using local fixtures, without a listening server
+- `SubscriptionParamsTest`: Happ and INCY INI overrides, plain/Base64 directive stripping, and provider ID preservation
+- `HttpTargetTest` (POSIX): HTTP target validation and app-specific subscription responses using local fixtures, without a listening server
 - `YamlTest`: Native Clash YAML node extraction, sanitization, and rule conversion
 - `PythonYamlTest`: Reference YAML test verification
 
